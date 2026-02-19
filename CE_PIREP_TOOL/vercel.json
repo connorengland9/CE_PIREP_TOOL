@@ -1,0 +1,14 @@
+{
+  "builds": [
+    {
+      "src": "CE_APP.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "CE_APP.py"
+    }
+  ]
+}
