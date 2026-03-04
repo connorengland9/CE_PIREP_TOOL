@@ -3,6 +3,7 @@ import time
 import json
 import re
 import urllib3
+import concurrent.futures
 from flask import Flask, render_template, jsonify, make_response
 from datetime import datetime, timezone, timedelta
 
@@ -25,7 +26,6 @@ AUX_AIRPORTS = [
 
 # --- LOGIC HELPERS ---
 def get_cloud_base(layer):
-    """Safely extract cloud base as an integer."""
     base = layer.get('base')
     try:
         if base is not None:
@@ -56,7 +56,9 @@ def check_pirep_condition(station_data):
                  val = float(vis.replace('+', ''))
             else:
                  val = float(vis)
-            if val <= 5.0: conditions.append(f"VIS {vis}SM")
+            if val <= 5.0: 
+                v_str = vis if isinstance(vis, str) else str(val)
+                conditions.append(f"VIS {v_str}SM")
         except ValueError: pass
 
     # 3. HAZARDOUS WX
@@ -73,7 +75,6 @@ def check_pirep_condition(station_data):
     return False, "PIREP NOT REQUIRED"
 
 def check_ifr_status(station_data):
-    # 1. CEILING
     clouds = station_data.get('clouds', [])
     for layer in clouds:
         cover = layer.get('cover', '')
@@ -81,7 +82,6 @@ def check_ifr_status(station_data):
         if cover in ['BKN', 'OVC', 'VV'] and base is not None and base < 1000:
             return True
             
-    # 2. VISIBILITY
     vis = station_data.get('visib')
     if vis is not None:
         try:
@@ -95,75 +95,132 @@ def check_ifr_status(station_data):
     return False
 
 def parse_ddhhmm_from_text(raw_text):
-    """
-    Extracts timestamp from METAR text (e.g. '150354Z') and converts to ISO string.
-    Uses current month/year, handling month boundary wrapping.
-    """
-    if not raw_text:
-        return None
+    if not raw_text: return None
         
-    # Regex for DDHHMMZ (e.g., 150354Z)
     match = re.search(r'\b(\d{2})(\d{2})(\d{2})Z\b', raw_text)
-    if not match:
-        return None
+    if not match: return None
         
     day, hour, minute = map(int, match.groups())
-    
     now = datetime.now(timezone.utc)
     
-    # Create a candidate date using current year/month
     try:
         candidate = now.replace(day=day, hour=hour, minute=minute, second=0, microsecond=0)
     except ValueError:
-        # Handle invalid day (e.g. 31st in a 30-day month if clocks drift)
         return None
 
-    # Handle month wrap-around logic
-    # If candidate is far in the future (e.g. today is 1st, metar says 30th), it's last month
     if (candidate - now).days > 5: 
-        # Move back one month
         if now.month == 1:
             candidate = candidate.replace(year=now.year - 1, month=12)
         else:
-            prev_month = now.month - 1
-            try:
-                candidate = candidate.replace(month=prev_month)
-            except ValueError:
-                 pass 
-
-    # If candidate is far in the past (e.g. today is 30th, metar says 1st), it's next month
+            try: candidate = candidate.replace(month=now.month - 1)
+            except ValueError: pass 
     elif (now - candidate).days > 5:
         pass
 
     return candidate.isoformat()
 
+
+# --- REDUNDANT METAR FETCHING LOGIC ---
+
+def extract_visibility(raw_text):
+    match = re.search(r'\b(M)?((\d+)\s+)?(\d+)/(\d+)SM\b', raw_text)
+    if match:
+        whole = float(match.group(3)) if match.group(3) else 0.0
+        num = float(match.group(4))
+        den = float(match.group(5))
+        return whole + (num / den)
+        
+    match_whole = re.search(r'\b(M)?(\d+)SM\b', raw_text)
+    if match_whole:
+        return float(match_whole.group(2))
+    return None
+
+def extract_clouds(raw_text):
+    clouds = []
+    for match in re.finditer(r'\b(FEW|SCT|BKN|OVC|VV)(\d{3})(CB|TCU)?\b', raw_text):
+        clouds.append({'cover': match.group(1), 'base': int(match.group(2)) * 100})
+    return clouds
+
+def map_navcanada_metar(nc_item, site):
+    raw_ob = nc_item.get('text', '')
+    report_time = nc_item.get('startValidity') or nc_item.get('date', '')
+    if report_time and not report_time.endswith('Z') and '+' not in report_time:
+        report_time += 'Z'
+        
+    return {
+        'icaoId': site,
+        'reportTime': report_time,
+        'rawOb': raw_ob,
+        'clouds': extract_clouds(raw_ob),
+        'visib': extract_visibility(raw_ob),
+        'wxString': raw_ob, 
+        'source': 'NAVCAN'
+    }
+
+def fetch_awc_metars(ids):
+    id_string = ",".join(ids)
+    url = "https://www.aviationweather.gov/api/data/metar"
+    params = { "ids": id_string, "format": "json", "taf": "false", "hours": 2, "_": int(time.time()) }
+    try:
+        res = requests.get(url, params=params, timeout=4)
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        print(f"   [ERROR] AWC METAR failed: {e}")
+    return []
+
+def fetch_navcanada_metars(ids):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36',
+        'Referer': 'https://plan.navcanada.ca/wxrecall/'
+    }
+    id_string = ",".join(ids)
+    url = f"https://plan.navcanada.ca/weather/api/alpha/?site={id_string}&alpha=metar"
+    results = []
+    try:
+        res = requests.get(url, headers=headers, timeout=4, verify=False)
+        if res.status_code == 200:
+            json_resp = res.json()
+            data_list = json_resp.get('data', []) if isinstance(json_resp, dict) else (json_resp or [])
+            if not isinstance(data_list, list): data_list = []
+            
+            for item in data_list:
+                raw_ob = item.get('text', '')
+                site = item.get('site')
+                if not site:
+                    match = re.search(r'\b(PG[A-Z]{2})\b', raw_ob)
+                    site = match.group(1) if match else None
+                if site and site in ids:
+                    results.append(map_navcanada_metar(item, site))
+    except Exception as e:
+        print(f"   [ERROR] NavCanada METAR failed: {e}")
+    return results
+
 def get_weather_data():
     main_results = []
     aux_results = []
-    
     all_ids = [a['id'] for a in MAIN_AIRPORTS] + [a['id'] for a in AUX_AIRPORTS]
-    id_string = ",".join(all_ids)
-
-    print(f"\n[METAR] Fetching weather data for {len(all_ids)} stations...")
-
-    try:
-        url = "https://www.aviationweather.gov/api/data/metar"
-        params = { "ids": id_string, "format": "json", "taf": "false", "hours": 2, "_": int(time.time()) }
+    
+    # Run both METAR fetches concurrently
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_awc = executor.submit(fetch_awc_metars, all_ids)
+        future_nc = executor.submit(fetch_navcanada_metars, all_ids)
+        awc_data = future_awc.result()
+        nc_data = future_nc.result()
         
-        response = requests.get(url, params=params, timeout=10)
-        json_data = response.json() if response.status_code == 200 else []
-            
-    except Exception as e:
-        print(f"[METAR] Connection Failed: {e}")
-        json_data = []
+    combined_data = awc_data + nc_data
+    
+    def get_best_report(code):
+        reports = [r for r in combined_data if r.get('icaoId') == code]
+        if not reports: return None
+        def sort_key(rep):
+            t = parse_ddhhmm_from_text(rep.get('rawOb', ''))
+            return t if t else rep.get('reportTime', '')
+        reports.sort(key=sort_key, reverse=True)
+        return reports[0] 
 
-    # --- PROCESS MAIN AIRPORTS ---
-    for airport in MAIN_AIRPORTS:
-        code = airport["id"]
-        station_reports = [item for item in json_data if item.get('icaoId') == code]
-        station_reports.sort(key=lambda x: x.get('reportTime', ''), reverse=True)
-        found = station_reports[0] if station_reports else None
-        
+    def process_airport(code, name):
+        found = get_best_report(code)
         if found:
             is_needed, reason = check_pirep_condition(found)
             is_ifr = check_ifr_status(found)
@@ -171,73 +228,30 @@ def get_weather_data():
             if is_ifr:
                 is_needed = True
                 if "IFR CONDITIONS" not in reason:
-                    if reason == "PIREP NOT REQUIRED":
-                        reason = "IFR CONDITIONS"
-                    else:
-                        reason = f"IFR CONDITIONS • {reason}"
+                    reason = "IFR CONDITIONS" if reason == "PIREP NOT REQUIRED" else f"IFR CONDITIONS • {reason}"
             
-            # --- FIX: FORCE PARSE TIME FROM TEXT ---
             raw_ob = found.get('rawOb', '')
-            text_based_time = parse_ddhhmm_from_text(raw_ob)
-            final_time = found.get('reportTime', '')
+            final_time = parse_ddhhmm_from_text(raw_ob) or found.get('reportTime', '')
             
-            if text_based_time:
-                final_time = text_based_time
-            
-            main_results.append({
-                "id": code, "name": airport["name"], "raw": raw_ob,
-                "time": final_time, 
-                "isoTime": final_time, # Parsing logic relies on this key in frontend
-                "pirep_needed": is_needed, 
-                "reason": reason, "is_ifr": is_ifr, "status": "online"
-            })
+            return {
+                "id": code, "name": name, "raw": raw_ob,
+                "time": final_time, "isoTime": final_time,
+                "pirep_needed": is_needed, "reason": reason, "is_ifr": is_ifr, "status": "online"
+            }
         else:
-            main_results.append({
-                "id": code, "name": airport["name"], "raw": "WAITING FOR DATA...",
+            return {
+                "id": code, "name": name, "raw": "WAITING FOR DATA...",
                 "time": "", "isoTime": "", 
                 "pirep_needed": False, "reason": "NO DATA", "is_ifr": False, "status": "offline"
-            })
+            }
 
-    # --- PROCESS AUX AIRPORTS ---
-    for airport in AUX_AIRPORTS:
-        code = airport["id"]
-        station_reports = [item for item in json_data if item.get('icaoId') == code]
-        station_reports.sort(key=lambda x: x.get('reportTime', ''), reverse=True)
-        found = station_reports[0] if station_reports else None
-        
-        if found:
-            is_needed, reason = check_pirep_condition(found)
-            is_ifr = check_ifr_status(found)
-            
-            if is_ifr:
-                is_needed = True
-                if "IFR CONDITIONS" not in reason:
-                    if reason == "PIREP NOT REQUIRED":
-                        reason = "IFR CONDITIONS"
-                    else:
-                        reason = f"IFR CONDITIONS • {reason}"
-            
-            raw_ob = found.get('rawOb', '')
-            text_based_time = parse_ddhhmm_from_text(raw_ob)
-            final_time = found.get('reportTime', '')
-            
-            if text_based_time:
-                final_time = text_based_time
-
-            aux_results.append({ 
-                "id": code, "name": airport["name"], "raw": raw_ob, 
-                "time": final_time,
-                "isoTime": final_time,
-                "pirep_needed": is_needed, "reason": reason, "is_ifr": is_ifr, "status": "online"
-            })
-        else:
-            aux_results.append({ 
-                "id": code, "name": airport["name"], "raw": "NO DATA AVAILABLE", "time": "",
-                "isoTime": "",
-                "pirep_needed": False, "reason": "NO DATA", "is_ifr": False, "status": "offline"
-            })
+    for apt in MAIN_AIRPORTS: main_results.append(process_airport(apt['id'], apt['name']))
+    for apt in AUX_AIRPORTS: aux_results.append(process_airport(apt['id'], apt['name']))
 
     return main_results, aux_results
+
+
+# --- FLASK ROUTES ---
 
 @app.route('/')
 def index():
@@ -245,20 +259,15 @@ def index():
     resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     return resp
 
-@app.route('/api/metars')
-def api_metars():
-    m, a = get_weather_data()
-    return jsonify(m)
 
 # --- PIREP FETCHING LOGIC ---
 
 def fetch_awc_pireps():
-    """Fetch from US Aviation Weather Center"""
     reports = []
     try:
         url = "https://www.aviationweather.gov/api/data/aircraftreport"
         params = { "format": "json", "bbox": "8.0,139.0,19.0,150.0", "age": 2, "_": int(time.time()) }
-        res = requests.get(url, params=params, timeout=5)
+        res = requests.get(url, params=params, timeout=4)
         if res.status_code == 200:
             raw = res.json()
             if isinstance(raw, list):
@@ -276,34 +285,23 @@ def fetch_awc_pireps():
     return reports
 
 def parse_pirep_fields(raw_text):
-    acft_str = "UNK"
-    fl_str = "UNK"
-    
-    if not raw_text:
-        return acft_str, fl_str
+    acft_str, fl_str = "UNK", "UNK"
+    if not raw_text: return acft_str, fl_str
         
     tp_match = re.search(r'/TP\s+([A-Z0-9\-/]+)', raw_text.upper())
-    if tp_match:
-        acft_str = tp_match.group(1).split('/')[0]
+    if tp_match: acft_str = tp_match.group(1).split('/')[0]
 
     fl_match = re.search(r'/FL\s*([A-Z0-9]+)', raw_text.upper()) 
     if fl_match:
         val_str = fl_match.group(1)
-        if "DURC" in val_str:
-            fl_str = "DURING CLIMB"
-        elif "DURD" in val_str:
-            fl_str = "DURING DESCENT"
-        elif val_str.isdigit():
-            val = int(val_str)
-            fl_str = f"FL{val:03d}"
-        else:
-            fl_str = val_str
+        if "DURC" in val_str: fl_str = "DURING CLIMB"
+        elif "DURD" in val_str: fl_str = "DURING DESCENT"
+        elif val_str.isdigit(): fl_str = f"FL{int(val_str):03d}"
+        else: fl_str = val_str
             
     if fl_str == "UNK":
-        if "DURC" in raw_text.upper():
-            fl_str = "DURING CLIMB"
-        elif "DURD" in raw_text.upper():
-            fl_str = "DURING DESCENT"
+        if "DURC" in raw_text.upper(): fl_str = "DURING CLIMB"
+        elif "DURD" in raw_text.upper(): fl_str = "DURING DESCENT"
     
     return acft_str, fl_str
 
@@ -313,19 +311,13 @@ def fetch_navcanada_pireps():
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36',
         'Referer': 'https://plan.navcanada.ca/wxrecall/'
     }
-
     url1 = "https://plan.navcanada.ca/weather/api/alpha/?site=PGUM&radius=300&alpha=pirep"
     try:
-        print(f" > [NAVCAN] Trying Method 1 (Site): {url1}")
-        res = requests.get(url1, headers=headers, timeout=5, verify=False)
-        
+        res = requests.get(url1, headers=headers, timeout=4, verify=False)
         if res.status_code == 200:
             json_resp = res.json()
-            data_list = []
-            if isinstance(json_resp, dict):
-                data_list = json_resp.get('data', [])
-            elif isinstance(json_resp, list):
-                data_list = json_resp
+            data_list = json_resp.get('data', []) if isinstance(json_resp, dict) else (json_resp or [])
+            if not isinstance(data_list, list): data_list = []
             
             for item in data_list:
                 raw_text = item.get('text', '')
@@ -339,7 +331,6 @@ def fetch_navcanada_pireps():
                     raw_time += 'Z'
 
                 acft, fl = parse_pirep_fields(raw_text)
-
                 reports.append({
                     "raw": raw_text,
                     "time": raw_time, 
@@ -347,53 +338,40 @@ def fetch_navcanada_pireps():
                     "acft": acft, "fl": fl, "source": "NAVCAN"
                 })
     except Exception as e:
-        print(f"   [ERROR] Method 1 failed: {e}")
+        print(f"   [ERROR] NavCanada PIREP failed: {e}")
 
     return reports
 
 def normalize_pirep_text(text):
-    """Normalize raw text to help deduplicate between sources."""
     if not text: return ""
     text_upper = text.upper()
-    
     match = re.search(r'\b(UA|UUA)\b', text_upper)
-    if match:
-        core_text = text_upper[match.start():]
-    else:
-        core_text = text_upper
-        
-    clean_key = re.sub(r'[^A-Z0-9]', '', core_text)
-    
-    return clean_key
+    if match: core_text = text_upper[match.start():]
+    else: core_text = text_upper
+    return re.sub(r'[^A-Z0-9]', '', core_text)
 
 @app.route('/api/data')
 def api_data():
-    main_metars, aux_metars = get_weather_data()
+    # Run ALL FOUR fetches concurrently (Multi-threading)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_weather = executor.submit(get_weather_data)
+        future_awc_pirep = executor.submit(fetch_awc_pireps)
+        future_nc_pirep = executor.submit(fetch_navcanada_pireps)
+        
+        main_metars, aux_metars = future_weather.result()
+        awc_data = future_awc_pirep.result()
+        nc_data = future_nc_pirep.result()
     
-    print("--- FETCHING PIREPS ---")
-    
-    awc_data = fetch_awc_pireps()
-    print(f" > [AWC] Found {len(awc_data)} reports.")
-    
-    nc_data = fetch_navcanada_pireps()
-    print(f" > [NAVCAN] Found {len(nc_data)} reports.")
-    
-    # SMART MERGE (Deduplication)
     combined = {}
     for r in awc_data:
         key = normalize_pirep_text(r['raw'])
         combined[key] = r
     
-    count_new_nc = 0
     for r in nc_data:
         key = normalize_pirep_text(r['raw'])
         if key not in combined:
             combined[key] = r
-            count_new_nc += 1
             
-    if count_new_nc > 0:
-        print(f"   [MERGE] Added {count_new_nc} unique reports from Nav Canada.")
-    
     filtered_pireps = []
     max_age_seconds = 65 * 60
     now_ts = time.time()
@@ -410,20 +388,12 @@ def api_data():
             if (now_ts - p_ts) <= max_age_seconds:
                 filtered_pireps.append(p)
         except Exception as e:
-            print(f"[FILTER ERROR] {e}")
             filtered_pireps.append(p)
             
     final_pireps = filtered_pireps
     final_pireps.sort(key=lambda x: x['time'], reverse=True)
     
-    print(f" > [MERGE] Sending {len(final_pireps)} unique reports (younger than 65m) to display.")
-
     return jsonify({ "metars": main_metars, "aux_metars": aux_metars, "pireps": final_pireps })
 
 if __name__ == '__main__':
-    print("=======================================")
-    print("   ZUA DEV SERVER (DUAL FEED ENABLED)  ")
-    print("   Sources: AviationWeather.gov + NavCanada")
-    print("=======================================")
-    # Running on All Interfaces (0.0.0.0) at port 5003
     app.run(host='0.0.0.0', port=5003, debug=True, threaded=True)
